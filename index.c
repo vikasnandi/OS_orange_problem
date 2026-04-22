@@ -79,7 +79,6 @@ int index_status(const Index *index) {
             if (strcmp(ent->d_name, ".pes") == 0) continue;
             if (strcmp(ent->d_name, "pes")  == 0) continue;
             if (strstr(ent->d_name, ".o")   != NULL) continue;
-
             int tracked = 0;
             for (int i = 0; i < index->count; i++) {
                 if (strcmp(index->entries[i].path, ent->d_name) == 0) {
@@ -98,11 +97,10 @@ int index_status(const Index *index) {
     }
     if (untracked_count == 0) printf("  (nothing to show)\n");
     printf("\n");
-
     return 0;
 }
 
-// ─── Helper: qsort comparator ────────────────────────────────────────────────
+// ─── Helper ──────────────────────────────────────────────────────────────────
 
 static int cmp_index_entries(const void *a, const void *b) {
     return strcmp(((const IndexEntry *)a)->path,
@@ -111,68 +109,55 @@ static int cmp_index_entries(const void *a, const void *b) {
 
 // ─── IMPLEMENTED ─────────────────────────────────────────────────────────────
 
-// Load the index from .pes/index.
-// A missing file is treated as an empty index (not an error).
-// Returns 0 on success, -1 on error.
 int index_load(Index *index) {
     index->count = 0;
 
     FILE *f = fopen(INDEX_FILE, "r");
     if (!f) {
-        if (errno == ENOENT) return 0;   // no index yet — that's fine
+        if (errno == ENOENT) return 0;
         return -1;
     }
 
-    char     hex[HASH_HEX_SIZE + 1];
+    char         hex[HASH_HEX_SIZE + 1];
     unsigned int  mode;
     unsigned long mtime_sec, size;
-    char     path[512];
+    char          path[512];
 
-    // Each line: <mode-octal> <hex-hash> <mtime> <size> <path>
     while (index->count < MAX_INDEX_ENTRIES &&
            fscanf(f, "%o %64s %lu %lu %511s",
                   &mode, hex, &mtime_sec, &size, path) == 5) {
-
         IndexEntry *e = &index->entries[index->count];
         e->mode      = mode;
         e->mtime_sec = (uint64_t)mtime_sec;
         e->size      = (uint32_t)size;
         strncpy(e->path, path, sizeof(e->path) - 1);
         e->path[sizeof(e->path) - 1] = '\0';
-
-        if (hex_to_hash(hex, &e->hash) != 0) {
-            fclose(f);
-            return -1;
-        }
+        if (hex_to_hash(hex, &e->hash) != 0) { fclose(f); return -1; }
         index->count++;
     }
-
     fclose(f);
     return 0;
 }
 
-// Save the index to .pes/index atomically (temp-file + rename).
-// Entries are sorted by path before writing.
-// Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    // Sort a copy so the on-disk file is always in path order
-    Index sorted = *index;
-    qsort(sorted.entries, sorted.count, sizeof(IndexEntry),
-          cmp_index_entries);
+    /* Index is ~5.6 MB — heap-allocate the sorted copy to avoid stack overflow */
+    Index *sorted = malloc(sizeof(Index));
+    if (!sorted) return -1;
+    *sorted = *index;
+    qsort(sorted->entries, sorted->count, sizeof(IndexEntry), cmp_index_entries);
 
-    // Write to a temp file in the same directory
     char tmp_path[600];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp_XXXXXX", INDEX_FILE);
 
     int fd = mkstemp(tmp_path);
-    if (fd < 0) return -1;
+    if (fd < 0) { free(sorted); return -1; }
 
     FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(tmp_path); return -1; }
+    if (!f) { close(fd); unlink(tmp_path); free(sorted); return -1; }
 
     char hex[HASH_HEX_SIZE + 1];
-    for (int i = 0; i < sorted.count; i++) {
-        const IndexEntry *e = &sorted.entries[i];
+    for (int i = 0; i < sorted->count; i++) {
+        const IndexEntry *e = &sorted->entries[i];
         hash_to_hex(&e->hash, hex);
         fprintf(f, "%o %s %lu %lu %s\n",
                 e->mode, hex,
@@ -180,8 +165,8 @@ int index_save(const Index *index) {
                 (unsigned long)(uint32_t)e->size,
                 e->path);
     }
+    free(sorted);
 
-    // Flush → fsync → atomic rename
     if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
         fclose(f); unlink(tmp_path); return -1;
     }
@@ -193,47 +178,38 @@ int index_save(const Index *index) {
     return 0;
 }
 
-// Stage a file: hash it as a blob, store it, update the index entry.
-// Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // 1. Read file contents
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "error: cannot open '%s': %s\n", path, strerror(errno));
         return -1;
     }
-
     fseek(f, 0, SEEK_END);
     long signed_size = ftell(f);
     rewind(f);
     if (signed_size < 0) { fclose(f); return -1; }
 
     size_t file_size = (size_t)signed_size;
-    void  *contents  = malloc(file_size ? file_size : 1);  // avoid malloc(0)
+    void  *contents  = malloc(file_size ? file_size : 1);
     if (!contents) { fclose(f); return -1; }
-
     if (file_size > 0 && fread(contents, 1, file_size, f) != file_size) {
         free(contents); fclose(f); return -1;
     }
     fclose(f);
 
-    // 2. Write blob to object store
     ObjectID id;
     if (object_write(OBJ_BLOB, contents, file_size, &id) != 0) {
         free(contents); return -1;
     }
     free(contents);
 
-    // 3. Get file metadata
     struct stat st;
     if (lstat(path, &st) != 0) return -1;
 
-    // 4. Update existing entry or append a new one
     IndexEntry *e = index_find(index, path);
     if (!e) {
         if (index->count >= MAX_INDEX_ENTRIES) {
-            fprintf(stderr, "error: index full\n");
-            return -1;
+            fprintf(stderr, "error: index full\n"); return -1;
         }
         e = &index->entries[index->count++];
     }
@@ -245,6 +221,5 @@ int index_add(Index *index, const char *path) {
     strncpy(e->path, path, sizeof(e->path) - 1);
     e->path[sizeof(e->path) - 1] = '\0';
 
-    // 5. Persist atomically
     return index_save(index);
 }
