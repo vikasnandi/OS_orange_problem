@@ -110,7 +110,7 @@ int object_write(ObjectType type, const void *data, size_t size, ObjectID *id_ou
     object_path(id_out, final_path, sizeof(final_path));
 
     // 6. Write to a temp file in the same shard directory
-    char tmp_path[512];
+    char tmp_path[600];
     snprintf(tmp_path, sizeof(tmp_path), "%s/tmp_XXXXXX", shard_dir);
     int fd = mkstemp(tmp_path);
     if (fd < 0) {
