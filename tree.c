@@ -184,9 +184,13 @@ static int write_tree_level(IndexEntry *entries, int count,
 // Build a tree hierarchy from the current index and write all tree objects
 // to the object store.  Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    Index idx;
-    if (index_load(&idx) != 0) return -1;
-    if (idx.count == 0)        return -1;   // nothing staged
+    /* Heap-allocate: Index is ~5.6 MB, too large for the stack */
+    Index *idx = malloc(sizeof(Index));
+    if (!idx) return -1;
+    if (index_load(idx) != 0) { free(idx); return -1; }
+    if (idx->count == 0)      { free(idx); return -1; }
 
-    return write_tree_level(idx.entries, idx.count, "", id_out);
+    int rc = write_tree_level(idx->entries, idx->count, "", id_out);
+    free(idx);
+    return rc;
 }
