@@ -1,0 +1,226 @@
+PES-VCS Analysis Questions — Phase 5 & 6
+Author: Vikas N <PES2UG24CS668>
+=========================================
+
+
+PHASE 5: BRANCHING AND CHECKOUT
+---------------------------------
+
+Q5.1: Implementing `pes checkout <branch>`
+-------------------------------------------
+
+A branch in PES-VCS is just a file at .pes/refs/heads/<branch> containing a
+commit hash. Creating a branch is as simple as writing a new file with the
+desired commit hash.
+
+To implement `pes checkout <branch>`, the following steps are needed:
+
+1. Read the target branch file at .pes/refs/heads/<branch> to get the target
+   commit hash. If the file does not exist, report an error.
+
+2. Walk the target commit's tree recursively. Starting from the commit object,
+   read its tree hash, then traverse the tree objects to enumerate every file
+   (blob) that should exist in the working directory.
+
+3. Update the working directory: for each blob in the target tree, read its
+   contents from the object store and write them to the correct path. Files
+   that exist in the current branch but not in the target branch must be
+   deleted.
+
+4. Update the index to match the new tree exactly, replacing all existing
+   entries with the entries from the checked-out tree.
+
+5. Update HEAD to point to the new branch:
+       ref: refs/heads/<branch>
+
+What makes this operation complex:
+
+- Conflict detection: if the user has modified a tracked file and that file
+  differs between the current and target branches, checkout must refuse to
+  proceed to avoid discarding unsaved work. This requires comparing the
+  working directory file against both the index and the target tree.
+
+- Subdirectory handling: the tree is recursive. Checkout must create
+  subdirectories as needed and remove them when they become empty.
+
+- Atomicity: if checkout fails midway (e.g. disk full), the working directory
+  could be left in a mixed state. A production implementation would stage all
+  changes in a temporary location before committing them.
+
+- Untracked files: files in the working directory that are not tracked by
+  either branch should be left alone unless the target branch contains a file
+  at the same path, in which case checkout must refuse to overwrite it.
+
+
+Q5.2: Detecting dirty working directory conflicts
+--------------------------------------------------
+
+To detect whether a file would cause a conflict during branch switching, using
+only the index and the object store (no re-hashing required for the fast path):
+
+Step 1 — Check if the file is modified relative to the index:
+  Compare st.st_mtime and st.st_size from lstat() against the values stored
+  in the index entry. If either differs, the file has been modified since it
+  was staged. This is the same fast-diff technique used in index_status().
+
+Step 2 — Check if the file differs between branches:
+  Look up the file's blob hash in the current branch's tree and in the target
+  branch's tree. If the two hashes are different, the file would be overwritten
+  by checkout.
+
+Step 3 — Conflict decision:
+  A conflict exists when BOTH of the above are true: the working copy has
+  been modified (step 1) AND the file content differs between branches (step 2).
+  If the file is clean (matches the index), checkout can safely overwrite it
+  because no local work would be lost.
+
+This approach avoids reading file contents entirely. It uses metadata
+(mtime, size) for fast change detection and compares object hashes in the
+two trees for branch difference detection. Only when a potential conflict is
+found does it need to go deeper.
+
+
+Q5.3: Detached HEAD state
+--------------------------
+
+Detached HEAD means HEAD contains a raw commit hash directly instead of a
+branch reference:
+
+    Normal:    HEAD -> "ref: refs/heads/main"  -> commit hash
+    Detached:  HEAD -> commit hash  (no branch involved)
+
+What happens if you make commits in detached HEAD state:
+
+New commits are created normally and chained to the previous commit as usual.
+However, because HEAD points directly to a hash rather than a branch file,
+there is no branch pointer being updated. Each new commit is only reachable
+by following HEAD directly. Once you checkout another branch, HEAD is updated
+to point to that branch, and the commits made in detached HEAD state become
+unreachable — no branch, tag, or ref points to them. They are not immediately
+deleted but become candidates for garbage collection.
+
+How a user can recover those commits:
+
+1. If the commit hash is still known (visible in terminal history or noted
+   down), the user can create a new branch pointing directly to it:
+       pes checkout -b recovery <hash>
+   or by manually writing the hash into a new ref file:
+       echo "<hash>" > .pes/refs/heads/recovery
+
+2. If the hash is not known, Git provides a reflog — a log of every position
+   HEAD has pointed to — which can be used to find the lost hash. PES-VCS does
+   not implement a reflog, so recovery without the hash would require scanning
+   all objects in the object store and identifying commits that are not
+   reachable from any branch (the inverse of garbage collection).
+
+3. The key window for recovery is before garbage collection runs. Once GC
+   deletes unreachable objects, the commits are permanently lost.
+
+
+=========================================
+PHASE 6: GARBAGE COLLECTION
+=========================================
+
+Q6.1: Finding and deleting unreachable objects
+-----------------------------------------------
+
+An object is reachable if it can be reached by starting from any branch ref
+and following pointers: branch -> commit -> tree -> subtrees -> blobs.
+Unreachable objects are everything else.
+
+Algorithm (mark-and-sweep):
+
+Mark phase:
+  1. Start with a set of all known root refs. Walk every file in
+     .pes/refs/heads/ to collect all branch tip commit hashes. Also include
+     HEAD if it is in detached state.
+
+  2. For each commit hash, add it to a reachable set (a hash set for O(1)
+     lookup). Read the commit object and add its tree hash. If the commit has
+     a parent, add the parent hash and recurse. Continue until all commits
+     in all branch histories are visited.
+
+  3. For each tree hash in the reachable set, read the tree object, parse its
+     entries, and add every blob hash and subtree hash to the reachable set.
+     Recurse into subtrees.
+
+Sweep phase:
+  4. Walk every file under .pes/objects/ using opendir/readdir recursively.
+     For each file found, reconstruct its full 64-character hex hash from its
+     directory path (first 2 chars) and filename (remaining 62 chars).
+
+  5. If the hash is NOT in the reachable set, the object is unreachable.
+     Delete it with unlink().
+
+Data structure: a hash set (e.g. a hash table or a sorted array with binary
+search) storing 32-byte ObjectIDs. This gives O(1) average lookup during the
+sweep phase.
+
+Estimate for 100,000 commits and 50 branches:
+
+  - Starting from 50 branch tips, we must visit every commit reachable from
+    any branch. In the worst case (linear history) this is 100,000 commits.
+  - Each commit points to a tree. Assuming an average project of 100 files
+    across 10 directories, each commit visits roughly 11 tree objects and
+    100 blob objects — about 111 objects per commit.
+  - Total objects to visit: 100,000 commits × ~112 objects = ~11.2 million
+    object reads in the mark phase.
+  - In practice, most blobs and trees are shared across commits, so the
+    reachable set might contain only 500,000 to 1,000,000 unique objects.
+    With deduplication, the mark phase visits far fewer unique files.
+
+
+Q6.2: GC race condition with concurrent commit
+-----------------------------------------------
+
+The race condition:
+
+Consider two concurrent processes — a committer (C) and a garbage collector
+(GC) — running at the same time with no synchronization:
+
+  Time 1: C calls tree_from_index(). It writes several blob objects and tree
+          objects to the object store. At this point these objects exist on
+          disk but no commit or branch ref points to them yet.
+
+  Time 2: GC starts its mark phase. It reads all branch refs and walks all
+          reachable objects. The new blobs and trees written by C in Time 1
+          are not reachable from any ref, so GC marks them as unreachable.
+
+  Time 3: GC runs its sweep phase and deletes the blobs and trees that C
+          just wrote, because they appeared unreachable.
+
+  Time 4: C calls object_write() for the commit object, then head_update()
+          to point the branch at the new commit. But the tree and blob objects
+          the commit depends on have already been deleted by GC.
+
+The result is a commit object that references tree and blob hashes that no
+longer exist in the object store — a broken repository.
+
+Why this is dangerous: the corruption is silent. The commit is created
+successfully and head_update() succeeds. The damage is only discovered later
+when someone tries to read the commit's tree, at which point object_read()
+fails with "file not found."
+
+How Git's real GC avoids this:
+
+1. Grace period: Git's gc never deletes objects that were created within the
+   last two weeks (configurable), regardless of reachability. This ensures
+   that objects written by an in-progress commit operation are safe even if
+   GC runs concurrently.
+
+2. Loose object safety: Git writes objects atomically using the same
+   temp-file-then-rename pattern we use in object_write(). An object either
+   exists completely or not at all, which prevents GC from reading a
+   half-written object.
+
+3. Lock files: Git uses lock files (.lock suffix) on ref files during updates.
+   GC checks for active lock files and will not run while a commit is updating
+   refs, reducing (but not eliminating) the race window.
+
+4. Reflogs: Git maintains a reflog that holds references to recent commits,
+   keeping them reachable even if the branch pointer moves. This gives a
+   recovery window even if GC does run during a commit.
+
+The fundamental lesson is that GC must be conservative: it is always safer
+to keep an object that might be unreachable than to delete an object that
+might still be needed.
