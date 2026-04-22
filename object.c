@@ -203,10 +203,12 @@ int object_read(const ObjectID *id, ObjectType *type_out,
 
     // 6. Copy data portion (everything after the '\0')
     size_t header_len = (size_t)(header_end - (char *)buffer) + 1;
-    *data_out = malloc(data_size);
+    /* +1 so callers can safely treat the data as a C string */
+    *data_out = malloc(data_size + 1);
     if (!(*data_out)) { free(buffer); return -1; }
 
     memcpy(*data_out, buffer + header_len, data_size);
+    ((char *)*data_out)[data_size] = '\0';
     *len_out = data_size;
 
     free(buffer);
